@@ -1,24 +1,16 @@
-"""Voxtral model loading and inference via MLX.
+"""Voxtral Realtime transcription via mlx-audio.
 
-Model: mistralai/Voxtral-Mini-4B-Realtime-2602
+Model:   mistralai/Voxtral-Mini-4B-Realtime-2602
 Weights: mlx-community/Voxtral-Mini-4B-Realtime-2602-4bit (~2–2.5GB)
 Library: mlx-audio (pip install mlx-audio[stt])
 
-Voxtral-Mini-4B-Realtime-2602 is architecturally distinct from Voxtral-Mini-3B-2507:
-- Purpose-built for streaming/real-time transcription (causal audio encoder)
-- Sub-200ms latency; configurable delay from 80ms to 2400ms in 80ms steps
-- Streaming decoder: yields tokens as audio is processed (not batch-only)
-- Official MLX support via mlx-audio (Mistral-endorsed community integration)
+mlx-audio provides a unified STT loader (mlx_audio.stt.load) that detects the
+model architecture and returns a model with a .generate() method. For Voxtral
+Realtime, generate() accepts numpy audio, runs the causal encoder + LM decoder
+on MLX (Metal GPU / Neural Engine), and returns an STTOutput with .text.
 
-Why mlx-audio over mlx-lm:
-- mlx-lm is designed for text LLMs; it has no audio encoder/processor support
-- mlx-audio provides the full STT pipeline: mel spectrogram → encoder → LM decoder
-- Realtime streaming API matches our push-to-talk architecture exactly
-
-Why MLX over PyTorch:
-- Unified memory: tensors shared between CPU and GPU without PCIe transfers
-- Metal-backed kernels compiled once and cached; fast after first run
-- Lower latency for streaming workloads on Apple Silicon
+Streaming (Phase 2): pass stream=True to generate() to get a generator that
+yields text deltas token-by-token as decoding progresses.
 """
 
 import logging
@@ -35,56 +27,58 @@ logger = logging.getLogger(__name__)
 
 
 class VoxtralModel:
-    """Wraps the Voxtral Realtime model for streaming transcription via MLX.
+    """Wraps Voxtral-Mini-4B-Realtime via mlx-audio for MLX-native transcription.
 
-    The model is loaded lazily. Call ``load()`` once at startup (takes ~5s
-    on first use while MLX compiles kernels; subsequent loads use the cache).
+    The model is loaded lazily. Call ``load()`` once at startup — it downloads
+    weights from HuggingFace on first run (~2.5GB) and caches them locally.
+    Subsequent loads are fast (weights already on disk, MLX kernels cached).
 
     Args:
-        model_path: Path to local MLX model directory. If the directory does
-            not exist, ``load()`` will raise a clear error directing the user
-            to run the setup script.
+        model_path: HuggingFace repo ID or local path to MLX model weights.
+        language: Default BCP-47 language code. Can be overridden per call.
+        transcription_delay_ms: Audio buffered before decoding starts (ms).
+            480ms is Mistral's recommended default (accuracy/latency sweet spot).
+            Lower values (e.g. 160ms) reduce latency; higher improves accuracy.
     """
 
-    def __init__(self, model_path: Path = MODEL_LOCAL_DIR) -> None:
-        self.model_path = Path(model_path)
+    def __init__(
+        self,
+        model_path: str | Path = MODEL_REPO_ID,
+        language: str = "en",
+        transcription_delay_ms: int = 480,
+    ) -> None:
+        self.model_path = str(model_path)
+        self.language = language
+        self.transcription_delay_ms = transcription_delay_ms
         self._model: Optional[object] = None
-        self._processor: Optional[object] = None
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def load(self) -> None:
-        """Load model weights into MLX (GPU/Neural Engine).
+        """Download (first run) and load Voxtral weights into MLX.
+
+        On first run this downloads ~2.5GB from HuggingFace and compiles Metal
+        kernels. Subsequent calls return immediately (model already loaded).
 
         Raises:
-            FileNotFoundError: If model weights are not present locally.
-                The error message instructs the user to run setup.sh.
-            ImportError: If mlx or mlx_lm are not installed.
+            ImportError: If mlx-audio is not installed.
         """
         if self._model is not None:
             return
 
-        if not self.model_path.exists():
-            raise FileNotFoundError(
-                f"Voxtral weights not found at {self.model_path}.\n"
-                "Run the setup script to download them:\n\n"
-                "    bash setup.sh\n"
-            )
-
-        logger.info("Loading Voxtral model from %s…", self.model_path)
-        t0 = time.perf_counter()
-
         try:
-            # mlx_audio provides the full STT pipeline for Voxtral:
-            # mel spectrogram extraction → causal audio encoder → LM decoder.
-            # load_models() returns the model graph and its associated processor.
-            from mlx_audio.stt.models.voxtral import load_models
-
-            self._model, self._processor = load_models(str(self.model_path))
+            from mlx_audio.stt import load as stt_load
         except ImportError as exc:
             raise ImportError(
                 "mlx-audio is not installed. Run: pip install 'mlx-audio[stt]'"
             ) from exc
+
+        logger.info("Loading Voxtral Realtime from %s…", self.model_path)
+        t0 = time.perf_counter()
+
+        # stt_load auto-detects model type from config.json and returns the
+        # appropriate mlx_audio.stt model (VoxtralRealtime in this case).
+        self._model = stt_load(self.model_path)
 
         elapsed = time.perf_counter() - t0
         logger.info("Voxtral loaded in %.1fs", elapsed)
@@ -98,80 +92,70 @@ class VoxtralModel:
     def transcribe(
         self,
         audio: np.ndarray,
-        language: str = "en",
-        max_tokens: int = 448,
+        language: Optional[str] = None,
     ) -> str:
-        """Transcribe a complete audio buffer to text (non-streaming).
-
-        Suitable for Phase 1 testing. Phase 2 uses ``transcribe_stream()``.
+        """Transcribe a complete audio buffer to text.
 
         Args:
-            audio: 1-D float32 numpy array at ``SAMPLE_RATE`` Hz.
-            language: BCP-47 language code (e.g. "en", "fr").
-            max_tokens: Maximum output tokens to generate.
+            audio: 1-D float32 numpy array at 16kHz.
+            language: BCP-47 language code. Defaults to self.language.
 
         Returns:
-            Transcribed text string (stripped of leading/trailing whitespace).
+            Transcribed text, stripped of leading/trailing whitespace.
 
         Raises:
             RuntimeError: If ``load()`` has not been called.
         """
         self._assert_loaded()
 
-        logger.debug("Transcribing %d samples (%.1fs audio)", len(audio), len(audio) / SAMPLE_RATE)
+        logger.debug(
+            "Transcribing %.1fs of audio", len(audio) / SAMPLE_RATE
+        )
         t0 = time.perf_counter()
 
-        # mlx_audio transcribe() handles: mel spectrogram → encoder → greedy decode.
-        # temperature=0.0 gives deterministic output (recommended for dictation).
-        result = self._model.transcribe(
+        # generate() with stream=False returns an STTOutput dataclass.
+        # temperature=0.0 → greedy decoding (deterministic, best for dictation).
+        result = self._model.generate(
             audio,
-            processor=self._processor,
-            language=language,
             temperature=0.0,
-            max_tokens=max_tokens,
+            stream=False,
+            transcription_delay_ms=self.transcription_delay_ms,
         )
-        text: str = result["text"].strip()
-        elapsed = time.perf_counter() - t0
-        logger.debug("Transcription complete in %.2fs: %r", elapsed, text[:80])
+        text: str = result.text.strip()
 
+        elapsed = time.perf_counter() - t0
+        logger.debug("Done in %.2fs: %r", elapsed, text[:80])
         return text
 
     def transcribe_stream(
         self,
         audio: np.ndarray,
-        language: str = "en",
-        max_tokens: int = 448,
+        language: Optional[str] = None,
     ) -> Generator[str, None, None]:
-        """Transcribe audio and yield text tokens as they are generated.
+        """Transcribe audio and yield text deltas as they are decoded.
 
         Used in Phase 2 for low-latency text injection — each token is
         injected into the target application as soon as it arrives.
 
         Args:
-            audio: 1-D float32 numpy array at ``SAMPLE_RATE`` Hz.
-            language: BCP-47 language code.
-            max_tokens: Maximum output tokens.
+            audio: 1-D float32 numpy array at 16kHz.
+            language: BCP-47 language code. Defaults to self.language.
 
         Yields:
-            str: Individual decoded token strings (may be subwords).
+            str: Text delta strings as the model decodes them.
 
         Raises:
             RuntimeError: If ``load()`` has not been called.
         """
         self._assert_loaded()
 
-        # mlx_audio's streaming transcribe yields partial text chunks as the
-        # causal encoder processes audio — ideal for low-latency token injection.
-        for chunk in self._model.transcribe_stream(
+        # generate() with stream=True returns a generator of text delta strings.
+        yield from self._model.generate(
             audio,
-            processor=self._processor,
-            language=language,
             temperature=0.0,
-            max_tokens=max_tokens,
-        ):
-            token_str: str = chunk.get("text", "")
-            if token_str:
-                yield token_str
+            stream=True,
+            transcription_delay_ms=self.transcription_delay_ms,
+        )
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 

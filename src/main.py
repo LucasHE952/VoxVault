@@ -54,17 +54,16 @@ def phase1_smoke_test(settings: Settings, duration_seconds: float = 5.0) -> None
     from audio.capture import AudioCapture
     from transcription.model import VoxtralModel
 
-    model_path = Path(settings["model_path"])
-    model = VoxtralModel(model_path=model_path)
+    model = VoxtralModel(language=settings["language"])
 
     print(f"\n{APP_NAME} v{APP_VERSION} — Phase 1 smoke test")
     print("=" * 50)
 
-    # Load model
-    print("Loading Voxtral model (first run compiles MLX kernels — ~30s) …")
+    # Load model (downloads ~2.5GB on first run via HuggingFace, then cached)
+    print("Loading Voxtral Realtime (downloads ~2.5GB on first run, then cached) …")
     try:
         model.load()
-    except FileNotFoundError as exc:
+    except ImportError as exc:
         print(f"\nERROR: {exc}", file=sys.stderr)
         sys.exit(1)
 
