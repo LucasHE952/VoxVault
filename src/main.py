@@ -3,7 +3,8 @@
 Phase 1 goal: confirm the model loads and produces accurate output.
 Run with: python src/main.py --phase1
 
-Full push-to-talk dictation (Phase 2+) will be added in subsequent phases.
+Full push-to-talk dictation with menu bar UI (Phase 3):
+Run with: python src/main.py
 """
 
 import argparse
@@ -116,11 +117,13 @@ def phase1_smoke_test(settings: Settings, duration_seconds: float = 5.0) -> None
     print("=" * 50)
 
 
-def run_dictation_loop(settings: Settings) -> None:
-    """Phase 2: Full push-to-talk dictation loop.
+def run_dictation_app(settings: Settings) -> None:
+    """Phase 3: Full dictation loop with menu bar UI.
 
-    Hold the configured hotkey to record. On release, the audio is
-    transcribed and injected into the focused application.
+    Architecture:
+      - rumps.App owns the main thread / NSRunLoop
+      - Transcription runs in a daemon thread
+      - ui_queue bridges background state changes to the main-thread overlay
 
     Args:
         settings: User settings instance.
@@ -133,6 +136,7 @@ def run_dictation_loop(settings: Settings) -> None:
     from injection.text_injector import TextInjector, check_accessibility_permission
     from transcription.model import VoxtralModel
     from transcription.streaming import AudioBuffer
+    from ui.menu_bar import DictationMenuBarApp, UIEvent
 
     # ── Accessibility permission check ────────────────────────────────────────
     if not check_accessibility_permission():
@@ -146,7 +150,7 @@ def run_dictation_loop(settings: Settings) -> None:
         )
         sys.exit(1)
 
-    # ── Load models ───────────────────────────────────────────────────────────
+    # ── Load models (blocking — do before rumps takes the main thread) ────────
     local_model_path = Path(__file__).parent.parent / "models" / "voxtral-realtime"
     model = VoxtralModel(model_path=local_model_path, language=settings["language"])
     vad = VoiceActivityDetector(sensitivity=settings["vad_sensitivity"])
@@ -158,12 +162,14 @@ def run_dictation_loop(settings: Settings) -> None:
     model.load()
     print("Loading Silero VAD...")
     vad.load()
-    print("Ready.\n")
+    print("Ready. Starting menu bar app…\n")
 
     # ── Shared state ──────────────────────────────────────────────────────────
     buffer = AudioBuffer()
     _recording = threading.Event()
+    _stop_event = threading.Event()
     _transcribe_queue: queue.Queue[Optional[np.ndarray]] = queue.Queue()
+    ui_queue: queue.Queue[UIEvent] = queue.Queue()
 
     # ── Hotkey callbacks (run in pynput's listener thread) ────────────────────
     def on_press() -> None:
@@ -171,20 +177,24 @@ def run_dictation_loop(settings: Settings) -> None:
         vad.reset_state()
         capture.drain()
         _recording.set()
-        print("\n[Recording...]", end="", flush=True)
+        ui_queue.put(UIEvent("recording"))
 
     def on_release() -> None:
         _recording.clear()
         audio = buffer.flush()
-        print(" done", flush=True)
         if audio is not None and len(audio) > 0:
+            ui_queue.put(UIEvent("transcribing"))
             _transcribe_queue.put(audio)
+        else:
+            ui_queue.put(UIEvent("idle"))
 
     # ── Audio collection thread ───────────────────────────────────────────────
     capture = AudioCapture(sample_rate=SAMPLE_RATE)
 
     def _collect_audio() -> None:
         for chunk in capture.stream():
+            if _stop_event.is_set():
+                break
             if _recording.is_set():
                 if vad.is_speech(chunk):
                     buffer.append_speech(chunk)
@@ -192,7 +202,9 @@ def run_dictation_loop(settings: Settings) -> None:
                     buffer.append_silence(chunk)
 
     capture.start()
-    collect_thread = threading.Thread(target=_collect_audio, daemon=True, name="audio-collector")
+    collect_thread = threading.Thread(
+        target=_collect_audio, daemon=True, name="audio-collector"
+    )
     collect_thread.start()
 
     # ── Hotkey listener ───────────────────────────────────────────────────────
@@ -203,20 +215,16 @@ def run_dictation_loop(settings: Settings) -> None:
     )
     hotkey.start()
 
-    print(f"Hold [{settings['hotkey']}] to dictate. Ctrl+C to quit.\n")
-
-    # ── Transcription loop (main thread) ──────────────────────────────────────
-    try:
-        while True:
+    # ── Transcription loop (daemon thread — main thread belongs to rumps) ─────
+    def _transcription_loop() -> None:
+        while not _stop_event.is_set():
             try:
                 audio = _transcribe_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
-
             if audio is None:
                 break
-
-            logger.info("Transcribing %.1fs of audio...", len(audio) / SAMPLE_RATE)
+            logger.info("Transcribing %.1fs of audio…", len(audio) / SAMPLE_RATE)
             try:
                 text = model.transcribe(audio, language=settings["language"])
                 if text:
@@ -228,13 +236,47 @@ def run_dictation_loop(settings: Settings) -> None:
                 logger.error("%s", exc)
             except Exception as exc:
                 logger.error("Transcription failed: %s", exc, exc_info=True)
+            finally:
+                ui_queue.put(UIEvent("done"))
 
-    except KeyboardInterrupt:
-        print("\nShutting down...")
-    finally:
+    transcription_thread = threading.Thread(
+        target=_transcription_loop, daemon=True, name="transcription-loop"
+    )
+    transcription_thread.start()
+
+    # ── Stop / restart callbacks passed to the menu bar app ──────────────────
+
+    def _stop_all() -> None:
+        """Called by the menu bar Quit action."""
+        _stop_event.set()
         hotkey.stop()
         capture.stop()
-        _transcribe_queue.put(None)
+        _transcribe_queue.put(None)  # unblock transcription thread
+
+    def _restart_hotkey(new_key: str) -> None:
+        """Called after the user captures a new hotkey in Settings."""
+        nonlocal hotkey
+        hotkey.stop()
+        hotkey = HotkeyListener(
+            hotkey=new_key,
+            on_press=on_press,
+            on_release=on_release,
+        )
+        hotkey.start()
+        logger.info("Hotkey listener restarted with key=%s", new_key)
+
+    # ── Menu bar app (takes over the main thread) ─────────────────────────────
+    app = DictationMenuBarApp(
+        settings=settings,
+        ui_queue=ui_queue,
+        stop_callback=_stop_all,
+        hotkey_restart_callback=_restart_hotkey,
+    )
+    # Provide the live VAD so settings can update its threshold immediately
+    # (must be done before app.run() since set_vad defers to AppKit startup)
+    app._vad_for_settings = vad  # picked up in _on_startup
+
+    app.run()  # blocks until Quit
 
 
 def main() -> None:
@@ -273,7 +315,7 @@ def main() -> None:
     if args.phase1:
         phase1_smoke_test(settings, duration_seconds=args.duration)
     else:
-        run_dictation_loop(settings)
+        run_dictation_app(settings)
 
 
 if __name__ == "__main__":

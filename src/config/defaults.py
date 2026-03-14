@@ -53,6 +53,12 @@ SUPPORTED_LANGUAGES: list[str] = [
 # in some apps; 0 works in most but 0.001 adds safety margin.
 KEYSTROKE_DELAY: float = 0.001
 
+# ── Overlay UI ───────────────────────────────────────────────────────────────
+OVERLAY_WIDTH_PT: float = 300.0
+OVERLAY_HEIGHT_PT: float = 56.0
+OVERLAY_CORNER_RADIUS: float = 28.0
+OVERLAY_DOCK_MARGIN_PT: float = 80.0  # pt above the dock / visible frame bottom
+
 # ── Default settings dict (serialised to JSON) ──────────────────────────────
 DEFAULT_SETTINGS: dict = {
     "hotkey": DEFAULT_HOTKEY,
