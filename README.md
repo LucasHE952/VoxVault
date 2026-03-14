@@ -1,4 +1,4 @@
-# ondevice-dictation
+# ondevice-ai-dictation
 
 > Accurate, private, local dictation for macOS — powered by Voxtral Realtime on Apple Silicon.
 
