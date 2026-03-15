@@ -189,7 +189,7 @@ def run_dictation_app(settings: Settings) -> None:
     # transcription doesn't pay the compilation cost (can add 2-3s otherwise).
     print("Warming up inference engine...")
     _warmup = np.zeros(int(SAMPLE_RATE * 0.25), dtype=np.float32)
-    list(model.transcribe_stream(_warmup))
+    model.transcribe(_warmup)
     print("Ready. Starting menu bar app…\n")
 
     # ── Shared state ──────────────────────────────────────────────────────────
@@ -282,28 +282,16 @@ def run_dictation_app(settings: Settings) -> None:
             logger.info("Transcribing %.1fs of audio…", len(audio) / SAMPLE_RATE)
             _transcribing.set()
             try:
-                # Stream tokens and inject each delta as it arrives so text
-                # appears progressively rather than all at once after full decode.
-                # Dismiss the spinner on the first token — visible text is enough
-                # feedback; no need to wait for the generator to fully exhaust.
-                accumulated: list[str] = []
-                cancelled_mid_stream = False
-                spinner_dismissed = False
-                for delta in model.transcribe_stream(audio, language=settings["language"]):
-                    if _cancel.is_set():
-                        cancelled_mid_stream = True
-                        break
-                    if delta:
-                        if not spinner_dismissed:
-                            ui_queue.put(UIEvent("done"))
-                            spinner_dismissed = True
-                        injector.type(delta)
-                        accumulated.append(delta)
-                text = "".join(accumulated)
-                if cancelled_mid_stream or _cancel.is_set():
+                # Voxtral Realtime is a corrective streaming model: it emits a
+                # draft transcription first, then re-emits corrected tokens as
+                # context improves. Streaming injection would type both versions.
+                # We use stream=False to wait for the final corrected output only.
+                text = model.transcribe(audio, language=settings["language"])
+                if _cancel.is_set():
                     logger.debug("Transcription result discarded (cancelled)")
                 elif text:
                     logger.info("Transcription: %r", text)
+                    injector.type(text)
                 else:
                     logger.debug("Empty transcription — no speech detected")
             except PermissionError as exc:

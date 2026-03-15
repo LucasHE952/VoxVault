@@ -45,7 +45,7 @@ class VoxtralModel:
         self,
         model_path: str | Path = MODEL_REPO_ID,
         language: str = "en",
-        transcription_delay_ms: int = 160,
+        transcription_delay_ms: int = 480,
     ) -> None:
         self.model_path = str(model_path)
         self.language = language
