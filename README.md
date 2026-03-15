@@ -16,7 +16,7 @@ Dictate into any app by holding a hotkey. All transcription runs entirely on you
 | Memory | 8GB unified | 16GB unified |
 | macOS | 13 (Ventura) | 14 (Sonoma) or later |
 | Disk space | 4GB free | — |
-| Python | 3.11 | 3.12 |
+| Python | 3.12 | 3.12 |
 
 ---
 
@@ -38,7 +38,7 @@ bash setup.sh
 - Check your hardware and macOS version
 - Create a Python virtual environment
 - Install all dependencies
-- Download the Voxtral model weights (~4GB, one time only)
+- Download the Voxtral model weights (~2.9GB, one time only)
 - Print instructions for granting required permissions
 
 ---
@@ -64,9 +64,18 @@ Without this permission, transcribed text cannot be typed into other apps.
 
 ## Usage
 
-### Phase 1 — Smoke test (available now)
+### Full dictation mode
 
-After setup, test that the model is working:
+```bash
+source .venv/bin/activate
+python src/main.py
+```
+
+The app runs in your menu bar. Hold the **Right Option** key to dictate into whatever app is in focus. Release to finish. Transcribed text is typed automatically.
+
+### Smoke test
+
+To verify the model loaded correctly without the full UI:
 
 ```bash
 source .venv/bin/activate
@@ -74,10 +83,6 @@ python src/main.py --phase1
 ```
 
 Speak for 5 seconds. Your transcription will be printed to the terminal.
-
-### Full dictation mode (Phase 2 — coming soon)
-
-Hold the **Right Option** key to dictate. Release to finish. Transcribed text is typed into whatever app is in focus.
 
 ---
 

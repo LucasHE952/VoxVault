@@ -284,13 +284,19 @@ def run_dictation_app(settings: Settings) -> None:
             try:
                 # Stream tokens and inject each delta as it arrives so text
                 # appears progressively rather than all at once after full decode.
+                # Dismiss the spinner on the first token — visible text is enough
+                # feedback; no need to wait for the generator to fully exhaust.
                 accumulated: list[str] = []
                 cancelled_mid_stream = False
+                spinner_dismissed = False
                 for delta in model.transcribe_stream(audio, language=settings["language"]):
                     if _cancel.is_set():
                         cancelled_mid_stream = True
                         break
                     if delta:
+                        if not spinner_dismissed:
+                            ui_queue.put(UIEvent("done"))
+                            spinner_dismissed = True
                         injector.type(delta)
                         accumulated.append(delta)
                 text = "".join(accumulated)
