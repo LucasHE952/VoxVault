@@ -31,6 +31,9 @@ models/*
 .Spotlight-V8
 .Trashes
 
+# Claude Code internal memory
+.claude/
+
 # IDEs
 .vscode/
 .idea/

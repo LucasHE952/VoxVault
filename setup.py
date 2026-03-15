@@ -124,9 +124,8 @@ OPTIONS = {
         "botocore",
     ],
     # ── App icon ──────────────────────────────────────────────────────────────
-    # Generate assets/app.icns with:  bash scripts/create_icon.sh
-    # Leave commented out until the icon file exists.
-    # "iconfile": "assets/app.icns",
+    # Regenerate with: sips + iconutil from assets/mic.png (see assets/app.iconset/)
+    "iconfile": "assets/app.icns",
 }
 
 setup(

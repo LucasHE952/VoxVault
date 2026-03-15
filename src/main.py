@@ -184,6 +184,12 @@ def run_dictation_app(settings: Settings) -> None:
         sys.exit(1)
     print("Loading VAD...")
     vad.load()
+
+    # Pre-compile MLX Metal kernels with a silent dummy pass so the first real
+    # transcription doesn't pay the compilation cost (can add 2-3s otherwise).
+    print("Warming up inference engine...")
+    _warmup = np.zeros(int(SAMPLE_RATE * 0.25), dtype=np.float32)
+    list(model.transcribe_stream(_warmup))
     print("Ready. Starting menu bar app…\n")
 
     # ── Shared state ──────────────────────────────────────────────────────────
@@ -276,12 +282,22 @@ def run_dictation_app(settings: Settings) -> None:
             logger.info("Transcribing %.1fs of audio…", len(audio) / SAMPLE_RATE)
             _transcribing.set()
             try:
-                text = model.transcribe(audio, language=settings["language"])
-                if _cancel.is_set():
+                # Stream tokens and inject each delta as it arrives so text
+                # appears progressively rather than all at once after full decode.
+                accumulated: list[str] = []
+                cancelled_mid_stream = False
+                for delta in model.transcribe_stream(audio, language=settings["language"]):
+                    if _cancel.is_set():
+                        cancelled_mid_stream = True
+                        break
+                    if delta:
+                        injector.type(delta)
+                        accumulated.append(delta)
+                text = "".join(accumulated)
+                if cancelled_mid_stream or _cancel.is_set():
                     logger.debug("Transcription result discarded (cancelled)")
                 elif text:
                     logger.info("Transcription: %r", text)
-                    injector.type(text)
                 else:
                     logger.debug("Empty transcription — no speech detected")
             except PermissionError as exc:
