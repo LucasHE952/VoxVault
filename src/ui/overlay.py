@@ -23,13 +23,10 @@ from AppKit import (
     NSAnimationContext,
     NSBezierPath,
     NSColor,
-    NSFont,
     NSMakeRect,
     NSPanel,
     NSProgressIndicator,
     NSScreen,
-    NSTextField,
-    NSTextAlignmentCenter,
     NSView,
     NSViewWidthSizable,
     NSViewHeightSizable,
@@ -78,10 +75,10 @@ class _WaveformView(NSView):
 
     # Bar geometry
     _BAR_COUNT = 5
-    _BAR_W = 4.0
-    _BAR_GAP = 7.0
-    _MIN_H = 6.0
-    _MAX_H = 30.0
+    _BAR_W = 3.0
+    _BAR_GAP = 5.0
+    _MIN_H = 3.0
+    _MAX_H = 18.0
     _SPEED = 5.0  # radians per second
 
     def initWithFrame_(self, frame):
@@ -90,6 +87,7 @@ class _WaveformView(NSView):
             return None
         self._active = False
         self._start_time = 0.0
+        self._amplitude = 0.0
         self.setWantsLayer_(True)
         return self
 
@@ -117,9 +115,15 @@ class _WaveformView(NSView):
         elapsed = time.monotonic() - self._start_time
         NSColor.whiteColor().colorWithAlphaComponent_(0.9).set()
 
+        # Normalise amplitude: typical speech RMS ~0.01–0.10 → map to 0–1.
+        # Log scaling gives better visual response across the volume range.
+        amp = min(1.0, max(0.0, (math.log10(max(self._amplitude, 0.001)) + 3) / 3))
+
         for i in range(self._BAR_COUNT):
             phase = elapsed * self._SPEED + i * 1.1
-            t = (math.sin(phase) + 1.0) / 2.0
+            sine_t = (math.sin(phase) + 1.0) / 2.0
+            # Baseline flutter always present; amplitude scales the full range.
+            t = 0.15 * sine_t + 0.85 * sine_t * amp
             h = self._MIN_H + t * (self._MAX_H - self._MIN_H)
             x = sx + i * (self._BAR_W + self._BAR_GAP)
             y = cy - h / 2
@@ -130,12 +134,17 @@ class _WaveformView(NSView):
 
     def start(self) -> None:
         self._active = True
+        self._amplitude = 0.0
         self._start_time = time.monotonic()
         self.setNeedsDisplay_(True)
 
     def stop(self) -> None:
         self._active = False
+        self._amplitude = 0.0
         self.setNeedsDisplay_(True)
+
+    def set_amplitude(self, value: float) -> None:
+        self._amplitude = value
 
     def tick(self) -> None:
         """Advance animation. Called every ~50ms from menu bar timer."""
@@ -157,7 +166,6 @@ class RecordingOverlay:
         self._panel, self._content = self._build_panel()
         self._waveform = self._build_waveform()
         self._spinner = self._build_spinner()
-        self._label = self._build_label()
 
     # ── Construction ─────────────────────────────────────────────────────────
 
@@ -196,17 +204,19 @@ class RecordingOverlay:
         return panel, vfx
 
     def _build_waveform(self) -> _WaveformView:
-        # Left zone: x=14..70, vertically centred
+        # Fill the entire pill — bars are drawn centred inside drawRect_
         wv = _WaveformView.alloc().initWithFrame_(
-            NSMakeRect(14, 8, 56, OVERLAY_HEIGHT_PT - 16)
+            NSMakeRect(0, 0, OVERLAY_WIDTH_PT, OVERLAY_HEIGHT_PT)
         )
         self._content.addSubview_(wv)
         return wv
 
     def _build_spinner(self) -> NSProgressIndicator:
-        # Same left zone as waveform, centered 20×20
+        # Centred 16×16 spinner
+        cx = (OVERLAY_WIDTH_PT - 16) / 2
+        cy = (OVERLAY_HEIGHT_PT - 16) / 2
         spinner = NSProgressIndicator.alloc().initWithFrame_(
-            NSMakeRect(28, (OVERLAY_HEIGHT_PT - 20) / 2, 20, 20)
+            NSMakeRect(cx, cy, 16, 16)
         )
         spinner.setStyle_(_SPINNER_STYLE)
         spinner.setControlSize_(_SMALL_CONTROL)
@@ -214,21 +224,11 @@ class RecordingOverlay:
         self._content.addSubview_(spinner)
         return spinner
 
-    def _build_label(self) -> NSTextField:
-        label = NSTextField.labelWithString_("Recording…")
-        label.setFrame_(NSMakeRect(76, 0, OVERLAY_WIDTH_PT - 92, OVERLAY_HEIGHT_PT))
-        label.setFont_(NSFont.systemFontOfSize_(13.0))
-        label.setTextColor_(NSColor.whiteColor())
-        label.setAlignment_(NSTextAlignmentCenter)
-        self._content.addSubview_(label)
-        return label
-
     # ── Public API ───────────────────────────────────────────────────────────
 
     def set_state(self, state: OverlayState) -> None:
         """Transition to the given state. Must be called on the main thread."""
         if state == OverlayState.RECORDING:
-            self._label.setStringValue_("Recording…")
             self._waveform.setHidden_(False)
             self._waveform.start()
             self._spinner.setHidden_(True)
@@ -236,7 +236,6 @@ class RecordingOverlay:
             self._show()
 
         elif state == OverlayState.TRANSCRIBING:
-            self._label.setStringValue_("Transcribing…")
             self._waveform.setHidden_(True)
             self._waveform.stop()
             self._spinner.setHidden_(False)
@@ -257,12 +256,13 @@ class RecordingOverlay:
 
         self._state = state
 
-    def tick(self) -> None:
+    def tick(self, amplitude: float = 0.0) -> None:
         """Called every ~50ms by the menu bar timer.
 
         Advances waveform animation and handles the auto-hide after DONE.
         """
         if self._state == OverlayState.RECORDING:
+            self._waveform.set_amplitude(amplitude)
             self._waveform.tick()
         elif self._state == OverlayState.DONE:
             if time.monotonic() - self._done_at >= 0.8:

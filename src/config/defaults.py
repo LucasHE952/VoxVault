@@ -54,9 +54,9 @@ SUPPORTED_LANGUAGES: list[str] = [
 KEYSTROKE_DELAY: float = 0.001
 
 # ── Overlay UI ───────────────────────────────────────────────────────────────
-OVERLAY_WIDTH_PT: float = 300.0
-OVERLAY_HEIGHT_PT: float = 56.0
-OVERLAY_CORNER_RADIUS: float = 28.0
+OVERLAY_WIDTH_PT: float = 80.0
+OVERLAY_HEIGHT_PT: float = 26.0
+OVERLAY_CORNER_RADIUS: float = 13.0
 OVERLAY_DOCK_MARGIN_PT: float = 80.0  # pt above the dock / visible frame bottom
 
 # ── Default settings dict (serialised to JSON) ──────────────────────────────

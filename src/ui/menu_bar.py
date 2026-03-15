@@ -52,6 +52,7 @@ class DictationMenuBarApp(rumps.App):
         self,
         settings,
         ui_queue: "queue.Queue[UIEvent]",
+        amplitude_ref: "list[float] | None" = None,
         stop_callback: Optional[Callable[[], None]] = None,
         hotkey_restart_callback: Optional[Callable[[str], None]] = None,
     ) -> None:
@@ -64,6 +65,7 @@ class DictationMenuBarApp(rumps.App):
 
         self._settings = settings
         self._ui_queue = ui_queue
+        self._amplitude_ref = amplitude_ref or [0.0]
         self._stop_callback = stop_callback
         self._hotkey_restart_callback = hotkey_restart_callback
 
@@ -139,10 +141,10 @@ class DictationMenuBarApp(rumps.App):
                 break
             self._apply_event(event)
 
-        # Advance overlay animation even if no new events
+        # Advance overlay animation, passing current mic amplitude
         if self._overlay is not None:
             try:
-                self._overlay.tick()
+                self._overlay.tick(self._amplitude_ref[0])
             except Exception:
                 logger.exception("Overlay tick error")
 

@@ -18,11 +18,26 @@ from typing import Optional
 
 import numpy as np
 
-# Ensure src/ is on the path when running as `python src/main.py`
-sys.path.insert(0, str(Path(__file__).parent))
+# Ensure src/ is on the path when running as `python src/main.py` (no-op in bundle)
+if not getattr(sys, "frozen", False):
+    sys.path.insert(0, str(Path(__file__).parent))
 
-from config.defaults import APP_NAME, APP_VERSION, LOG_FILE, SAMPLE_RATE
+from config.defaults import APP_NAME, APP_VERSION, LOG_FILE, MODEL_LOCAL_DIR, SAMPLE_RATE
 from config.settings import Settings
+
+
+def _show_alert(title: str, message: str) -> None:
+    """Show a native NSAlert dialog (visible even when running as a .app bundle)."""
+    try:
+        from AppKit import NSAlert, NSWarningAlertStyle
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_(title)
+        alert.setInformativeText_(message)
+        alert.setAlertStyle_(NSWarningAlertStyle)
+        alert.runModal()
+    except Exception:
+        # Fallback for environments where AppKit isn't available
+        print(f"\n{title}\n{message}", file=sys.stderr)
 
 
 def _configure_logging(verbose: bool = False) -> None:
@@ -58,9 +73,8 @@ def phase1_smoke_test(settings: Settings, duration_seconds: float = 5.0) -> None
     from audio.capture import AudioCapture
     from transcription.model import VoxtralModel
 
-    local_model_path = Path(__file__).parent.parent / "models" / "voxtral-realtime"
     model = VoxtralModel(
-        model_path=local_model_path,
+        model_path=MODEL_LOCAL_DIR,
         language=settings["language"],
     )
 
@@ -151,15 +165,23 @@ def run_dictation_app(settings: Settings) -> None:
         sys.exit(1)
 
     # ── Load models (blocking — do before rumps takes the main thread) ────────
-    local_model_path = Path(__file__).parent.parent / "models" / "voxtral-realtime"
-    model = VoxtralModel(model_path=local_model_path, language=settings["language"])
+    model = VoxtralModel(model_path=MODEL_LOCAL_DIR, language=settings["language"])
     vad = VoiceActivityDetector(sensitivity=settings["vad_sensitivity"])
     injector = TextInjector()
 
     print(f"\n{APP_NAME} v{APP_VERSION} — dictation mode")
     print("=" * 50)
     print("Loading Voxtral Realtime...")
-    model.load()
+    try:
+        model.load()
+    except Exception as exc:
+        _show_alert(
+            "Model not found",
+            f"Could not load Voxtral weights from:\n{MODEL_LOCAL_DIR}\n\n"
+            "Run setup.sh to download the model (~2.9 GB).\n\n"
+            f"Error: {exc}",
+        )
+        sys.exit(1)
     print("Loading Silero VAD...")
     vad.load()
     print("Ready. Starting menu bar app…\n")
@@ -167,12 +189,18 @@ def run_dictation_app(settings: Settings) -> None:
     # ── Shared state ──────────────────────────────────────────────────────────
     buffer = AudioBuffer()
     _recording = threading.Event()
+    _transcribing = threading.Event()
+    _cancel = threading.Event()
     _stop_event = threading.Event()
     _transcribe_queue: queue.Queue[Optional[np.ndarray]] = queue.Queue()
     ui_queue: queue.Queue[UIEvent] = queue.Queue()
+    # Single-element list so the audio thread can write amplitude and the
+    # main thread can read it without locks (GIL makes float writes atomic).
+    _amplitude: list[float] = [0.0]
 
     # ── Hotkey callbacks (run in pynput's listener thread) ────────────────────
     def on_press() -> None:
+        _cancel.clear()
         buffer.clear()
         vad.reset_state()
         capture.drain()
@@ -181,12 +209,37 @@ def run_dictation_app(settings: Settings) -> None:
 
     def on_release() -> None:
         _recording.clear()
+        if _cancel.is_set():
+            # Escape was pressed while hotkey was held — discard everything.
+            buffer.clear()
+            _cancel.clear()
+            ui_queue.put(UIEvent("idle"))
+            return
         audio = buffer.flush()
         if audio is not None and len(audio) > 0:
             ui_queue.put(UIEvent("transcribing"))
             _transcribe_queue.put(audio)
         else:
             ui_queue.put(UIEvent("idle"))
+
+    # ── Escape cancels recording or pending transcription ─────────────────────
+    def on_escape() -> None:
+        if _recording.is_set() or _transcribing.is_set():
+            logger.debug("Cancel requested via Escape")
+            _cancel.set()
+            _recording.clear()
+            buffer.clear()
+            ui_queue.put(UIEvent("idle"))
+
+    from pynput import keyboard as _kb
+
+    def _on_key(key):
+        if key == _kb.Key.esc:
+            on_escape()
+
+    _escape_listener = _kb.Listener(on_press=_on_key)
+    _escape_listener.daemon = True
+    _escape_listener.start()
 
     # ── Audio collection thread ───────────────────────────────────────────────
     capture = AudioCapture(sample_rate=SAMPLE_RATE)
@@ -196,10 +249,15 @@ def run_dictation_app(settings: Settings) -> None:
             if _stop_event.is_set():
                 break
             if _recording.is_set():
+                # Exponential moving average — smooths out per-chunk spikes
+                rms = float(np.sqrt(np.mean(chunk ** 2)))
+                _amplitude[0] = _amplitude[0] * 0.4 + rms * 0.6
                 if vad.is_speech(chunk):
                     buffer.append_speech(chunk)
                 else:
                     buffer.append_silence(chunk)
+            else:
+                _amplitude[0] = 0.0
 
     capture.start()
     collect_thread = threading.Thread(
@@ -225,9 +283,12 @@ def run_dictation_app(settings: Settings) -> None:
             if audio is None:
                 break
             logger.info("Transcribing %.1fs of audio…", len(audio) / SAMPLE_RATE)
+            _transcribing.set()
             try:
                 text = model.transcribe(audio, language=settings["language"])
-                if text:
+                if _cancel.is_set():
+                    logger.debug("Transcription result discarded (cancelled)")
+                elif text:
                     logger.info("Transcription: %r", text)
                     injector.type(text)
                 else:
@@ -237,7 +298,10 @@ def run_dictation_app(settings: Settings) -> None:
             except Exception as exc:
                 logger.error("Transcription failed: %s", exc, exc_info=True)
             finally:
-                ui_queue.put(UIEvent("done"))
+                _transcribing.clear()
+                cancelled = _cancel.is_set()
+                _cancel.clear()
+                ui_queue.put(UIEvent("idle" if cancelled else "done"))
 
     transcription_thread = threading.Thread(
         target=_transcription_loop, daemon=True, name="transcription-loop"
@@ -250,6 +314,7 @@ def run_dictation_app(settings: Settings) -> None:
         """Called by the menu bar Quit action."""
         _stop_event.set()
         hotkey.stop()
+        _escape_listener.stop()
         capture.stop()
         _transcribe_queue.put(None)  # unblock transcription thread
 
@@ -269,6 +334,7 @@ def run_dictation_app(settings: Settings) -> None:
     app = DictationMenuBarApp(
         settings=settings,
         ui_queue=ui_queue,
+        amplitude_ref=_amplitude,
         stop_callback=_stop_all,
         hotkey_restart_callback=_restart_hotkey,
     )
