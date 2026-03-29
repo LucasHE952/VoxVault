@@ -184,9 +184,11 @@ class DictationMenuBarApp(rumps.App):
             logger.warning("Settings window not available")
 
     def _quit(self, _sender) -> None:
-        if self._stop_callback:
-            self._stop_callback()
-        rumps.quit_application()
+        try:
+            if self._stop_callback:
+                self._stop_callback()
+        finally:
+            rumps.quit_application()
 
     # ── Icon helpers ──────────────────────────────────────────────────────────
 

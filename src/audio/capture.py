@@ -87,6 +87,8 @@ class AudioCapture:
                 self._stream.close()
                 self._stream = None
                 logger.info("Microphone capture stopped")
+        # Unblock any stream() generator waiting on queue.get()
+        self._queue.put_nowait(None)
 
     def stream(self) -> Generator[np.ndarray, None, None]:
         """Yield audio chunks as float32 numpy arrays of shape (chunk_size,).
