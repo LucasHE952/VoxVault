@@ -185,10 +185,13 @@ def run_dictation_app(settings: Settings) -> None:
     print("Loading VAD...")
     vad.load()
 
-    # Pre-compile MLX Metal kernels with a silent dummy pass so the first real
-    # transcription doesn't pay the compilation cost (can add 2-3s otherwise).
+    # Pre-compile MLX Metal kernels with a speech-like dummy pass so the first
+    # real transcription doesn't pay the compilation cost (can add 2-3s otherwise).
+    # White noise (non-zero signal) exercises both the encoder and the LM decoder's
+    # token generation kernels, unlike silence which short-circuits the decoder path.
     print("Warming up inference engine...")
-    _warmup = np.zeros(int(SAMPLE_RATE * 0.25), dtype=np.float32)
+    rng = np.random.default_rng(seed=0)
+    _warmup = rng.standard_normal(int(SAMPLE_RATE * 0.5)).astype(np.float32) * 0.01
     model.transcribe(_warmup)
     print("Ready. Starting menu bar app…\n")
 
@@ -203,6 +206,12 @@ def run_dictation_app(settings: Settings) -> None:
     # Single-element list so the audio thread can write amplitude and the
     # main thread can read it without locks (GIL makes float writes atomic).
     _amplitude: list[float] = [0.0]
+    # MLX Metal command buffers are not thread-safe. Both the transcription
+    # thread (model.transcribe) and the audio-collector thread (vad.is_speech)
+    # dispatch Metal work. Without serialisation, concurrent calls crash with:
+    #   "encodeSignalEvent:value: with uncommitted encoder"
+    # This lock ensures only one MLX caller runs Metal work at a time.
+    _mlx_lock = threading.Lock()
 
     # ── Hotkey callbacks (run on main thread via CGEventTap) ─────────────────
     def on_press() -> None:
@@ -241,21 +250,41 @@ def run_dictation_app(settings: Settings) -> None:
     capture = AudioCapture(sample_rate=SAMPLE_RATE)
 
     def _collect_audio() -> None:
-        for chunk in capture.stream():
-            if _stop_event.is_set():
-                break
-            if _recording.is_set():
-                # Exponential moving average — smooths out per-chunk spikes
-                rms = float(np.sqrt(np.mean(chunk ** 2)))
-                _amplitude[0] = _amplitude[0] * 0.4 + rms * 0.6
-                if vad.is_speech(chunk):
-                    buffer.append_speech(chunk)
+        try:
+            for chunk in capture.stream():
+                if _stop_event.is_set():
+                    break
+                if _recording.is_set():
+                    # Exponential moving average — smooths out per-chunk spikes
+                    rms = float(np.sqrt(np.mean(chunk ** 2)))
+                    _amplitude[0] = _amplitude[0] * 0.4 + rms * 0.6
+                    with _mlx_lock:
+                        speech = vad.is_speech(chunk)
+                    if speech:
+                        buffer.append_speech(chunk)
+                    else:
+                        buffer.append_silence(chunk)
                 else:
-                    buffer.append_silence(chunk)
-            else:
-                _amplitude[0] = 0.0
+                    _amplitude[0] = 0.0
+        except Exception:
+            logger.exception("Audio-collector thread crashed — microphone may have stopped")
 
-    capture.start()
+    # Restart capture stream if AUHAL initialization fails (err=-50 on macOS).
+    # This can happen when the device's native sample rate conflicts with the
+    # requested 16kHz; a brief pause and retry lets AUHAL settle.
+    import time as _time
+    for _attempt in range(3):
+        try:
+            capture.start()
+            break
+        except Exception as exc:
+            if _attempt < 2:
+                logger.warning("Audio capture start failed (attempt %d): %s — retrying", _attempt + 1, exc)
+                _time.sleep(0.5)
+            else:
+                logger.error("Audio capture failed after 3 attempts: %s", exc)
+                raise
+
     collect_thread = threading.Thread(
         target=_collect_audio, daemon=True, name="audio-collector"
     )
@@ -286,7 +315,10 @@ def run_dictation_app(settings: Settings) -> None:
                 # draft transcription first, then re-emits corrected tokens as
                 # context improves. Streaming injection would type both versions.
                 # We use stream=False to wait for the final corrected output only.
-                text = model.transcribe(audio, language=settings["language"])
+                # _mlx_lock serialises Metal work between this thread and the
+                # VAD calls in the audio-collector thread.
+                with _mlx_lock:
+                    text = model.transcribe(audio, language=settings["language"])
                 if _cancel.is_set():
                     logger.debug("Transcription result discarded (cancelled)")
                 elif text:

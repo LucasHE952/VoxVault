@@ -26,9 +26,9 @@ from config.defaults import MODEL_LOCAL_DIR, MODEL_REPO_ID, SAMPLE_RATE
 logger = logging.getLogger(__name__)
 
 # Voxtral Realtime's mlx-audio generate() silently returns empty text for
-# audio longer than ~15s when called in batch mode (stream=False). Segment
-# any recording longer than this and concatenate the results.
-# 10s gives a comfortable 5s margin below the observed ~15s failure threshold.
+# audio longer than ~12s in batch mode (stream=False) — the observed failure
+# threshold is lower than the theoretical 15s limit, likely content-dependent.
+# 10s gives a safe margin; do not increase without thorough testing.
 _MAX_SEGMENT_SECONDS: float = 10.0
 _MAX_SEGMENT_SAMPLES: int = int(_MAX_SEGMENT_SECONDS * SAMPLE_RATE)
 
@@ -44,15 +44,18 @@ class VoxtralModel:
         model_path: HuggingFace repo ID or local path to MLX model weights.
         language: Default BCP-47 language code. Can be overridden per call.
         transcription_delay_ms: Audio buffered before decoding starts (ms).
-            480ms is Mistral's recommended default (accuracy/latency sweet spot).
-            Lower values (e.g. 160ms) reduce latency; higher improves accuracy.
+            160ms is optimised for batch mode (stream=False) where the full audio
+            is already available before generate() is called — the model does not
+            need to wait for more audio to arrive, so the 480ms "realtime" default
+            only adds unnecessary latency. 160ms preserves enough acoustic context
+            for the encoder without stalling the decoder.
     """
 
     def __init__(
         self,
         model_path: str | Path = MODEL_REPO_ID,
         language: str = "en",
-        transcription_delay_ms: int = 480,
+        transcription_delay_ms: int = 160,
     ) -> None:
         self.model_path = str(model_path)
         self.language = language
@@ -90,6 +93,24 @@ class VoxtralModel:
         elapsed = time.perf_counter() - t0
         logger.info("Voxtral loaded in %.1fs", elapsed)
 
+        # Pin model weights in GPU-accessible (wired) memory for the session.
+        # Without this, Metal may page weights to system RAM between inference
+        # calls, causing each decoder step to re-fetch weights over the memory
+        # bus and dropping throughput from ~30 tok/s to ~9 tok/s.
+        # mlx-audio's own generate_transcription() does this via wired_limit();
+        # we set it once globally since the model stays loaded.
+        try:
+            import mlx.core as mx
+            if mx.metal.is_available():
+                max_rec = mx.device_info()["max_recommended_working_set_size"]
+                mx.set_wired_limit(max_rec)
+                logger.info(
+                    "Metal wired limit set to %.1f GB",
+                    max_rec / 1024 ** 3,
+                )
+        except Exception as exc:
+            logger.warning("Could not set Metal wired limit: %s", exc)
+
     def is_loaded(self) -> bool:
         """Return True if model weights are in memory."""
         return self._model is not None
@@ -116,16 +137,21 @@ class VoxtralModel:
         self._assert_loaded()
 
         duration = len(audio) / SAMPLE_RATE
-        logger.debug("Transcribing %.1fs of audio", duration)
         t0 = time.perf_counter()
 
         if len(audio) > _MAX_SEGMENT_SAMPLES:
+            n_segments = -(-len(audio) // _MAX_SEGMENT_SAMPLES)  # ceiling div
+            logger.info(
+                "Transcribing %.1fs of audio → %d segment(s) of ≤%.0fs",
+                duration, n_segments, _MAX_SEGMENT_SECONDS,
+            )
             text = self._transcribe_segmented(audio, language)
         else:
+            logger.info("Transcribing %.1fs of audio", duration)
             text = self._transcribe_chunk(audio)
 
         elapsed = time.perf_counter() - t0
-        logger.debug("Done in %.2fs: %r", elapsed, text[:80])
+        logger.info("Transcription done in %.2fs (%.1fx realtime): %r", elapsed, elapsed / duration, text[:80])
         return text
 
     def _transcribe_chunk(self, audio: np.ndarray) -> str:
@@ -176,8 +202,13 @@ class VoxtralModel:
 
         parts: list[str] = []
         for idx, segment in enumerate(segments):
+            t_seg = time.perf_counter()
             text = self._transcribe_chunk(segment)
-            logger.debug("Segment %d/%d: %r", idx + 1, len(segments), text[:60])
+            seg_elapsed = time.perf_counter() - t_seg
+            logger.info(
+                "Segment %d/%d (%.1fs audio): %.2fs → %r",
+                idx + 1, len(segments), len(segment) / SAMPLE_RATE, seg_elapsed, text[:60],
+            )
             if text:
                 parts.append(text)
 
