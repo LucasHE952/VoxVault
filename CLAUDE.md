@@ -343,6 +343,38 @@ These are non-obvious issues discovered during development. Check here before de
   copying the `.app` bundle to `/Applications/`. `cp -r` dereferences symlinks,
   breaking the Python.framework structure and invalidating the code signature.
 
+- **MLX Metal wired memory limit must be set after model load.** Without calling
+  `mx.set_wired_limit(mx.device_info()["max_recommended_working_set_size"])`, Metal
+  may page model weights between decoder steps, dropping throughput from ~30 tok/s to
+  ~9 tok/s (~1.6x realtime). Setting it once after `stt_load()` pins all weights in
+  GPU-accessible memory for the session, achieving ~0.7x realtime. This is what
+  mlx-audio's own `generate_transcription()` does via its `wired_limit()` context
+  manager — we must replicate it when calling `model.generate()` directly.
+  Use `mx.device_info()` not `mx.metal.device_info()` (deprecated).
+
+- **MLX Metal operations are not thread-safe across threads.** The transcription thread
+  (`model.transcribe`) and the audio-collector thread (`vad.is_speech`) both dispatch
+  Metal work. Running them concurrently crashes with:
+  `-[IOGPUMetalCommandBuffer encodeSignalEvent:value:]: failed assertion 'encodeSignalEvent:value: with uncommitted encoder'`
+  Serialise all MLX calls behind a shared `threading.Lock()` (`_mlx_lock` in `main.py`).
+
+- **transcription_delay_ms should be 160 in batch mode, not 480.** The default 480ms
+  delay is designed for streaming mode where the model waits for more audio to arrive.
+  In batch mode (`stream=False`) the full audio is already buffered before `generate()`
+  is called, so 480ms is pure wasted latency. Use 160ms.
+
+- **Voxtral silent failure threshold is ~12s, not ~15s.** The `generate()` batch mode
+  returns empty or garbage text for audio longer than ~12s (content-dependent). The
+  theoretical limit is ~15s but is not reliable in practice. Keep `_MAX_SEGMENT_SECONDS`
+  at 10s and do not increase it without thorough testing across varied content.
+
+- **PortAudio AUHAL err=-50 on startup.** macOS's AUHAL layer can emit
+  `||PaMacCore (AUHAL)|| Error on line 2523: err='-50'` during audio stream
+  initialisation when the device's native sample rate conflicts with the requested 16kHz.
+  Add retry logic (3 attempts, 0.5s delay) around `capture.start()`. Also wrap the
+  audio-collector thread body in a try/except and log exceptions — daemon thread crashes
+  are otherwise silent and result in the audio buffer staying permanently empty.
+
 ---
 
 ## README Requirements
