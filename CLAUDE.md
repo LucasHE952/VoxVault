@@ -345,23 +345,32 @@ These are non-obvious issues discovered during development. Check here before de
 
 - **MLX Metal wired memory limit must be set after model load.** Without calling
   `mx.set_wired_limit(mx.device_info()["max_recommended_working_set_size"])`, Metal
-  may page model weights between decoder steps, dropping throughput from ~30 tok/s to
-  ~9 tok/s (~1.6x realtime). Setting it once after `stt_load()` pins all weights in
-  GPU-accessible memory for the session, achieving ~0.7x realtime. This is what
-  mlx-audio's own `generate_transcription()` does via its `wired_limit()` context
-  manager — we must replicate it when calling `model.generate()` directly.
-  Use `mx.device_info()` not `mx.metal.device_info()` (deprecated).
+  may page model weights between decoder steps, degrading throughput significantly.
+  Setting it once after `stt_load()` pins all weights in GPU-accessible memory for
+  the session. This is what mlx-audio's own `generate_transcription()` does via its
+  `wired_limit()` context manager — we must replicate it when calling `model.generate()`
+  directly. Use `mx.device_info()` not `mx.metal.device_info()` (deprecated).
+
+- **Voxtral inference runs at ~1.0x realtime on M-series, not sub-realtime.** Benchmarks
+  on an Apple M5 MacBook Air (4-bit Voxtral-Mini-4B-Realtime) measured `time ≈ 0.86s
+  + 1.04s × audio_seconds` per `generate()` call, across audio lengths 5–10s — i.e.
+  ~0.86s fixed setup per call plus ~1.04× realtime marginal. This is the steady-state
+  ceiling with `wired_limit` set and a real-speech warmup. An earlier note in this
+  file claimed `~0.7x realtime` — that figure was wrong, do not chase it. A 30s
+  dictation cannot be transcribed in under ~32s on M5-class hardware without swapping
+  the model (e.g. mlx-whisper, typically 4–7× faster but offline-batch-designed).
+  Older chips (M1/M2) will be slower; run `scripts/benchmark_inference.py` to measure.
+
+- **`transcription_delay_ms` has no measurable effect in batch mode.** Tested 160 /
+  80 / 40 on 5s, 8s, and 10s clips — medians were within noise (≤3% spread) at every
+  length. The parameter only matters in streaming mode (`stream=True`). Keep at 160
+  for simplicity; don't bother tuning it for speed.
 
 - **MLX Metal operations are not thread-safe across threads.** The transcription thread
   (`model.transcribe`) and the audio-collector thread (`vad.is_speech`) both dispatch
   Metal work. Running them concurrently crashes with:
   `-[IOGPUMetalCommandBuffer encodeSignalEvent:value:]: failed assertion 'encodeSignalEvent:value: with uncommitted encoder'`
   Serialise all MLX calls behind a shared `threading.Lock()` (`_mlx_lock` in `main.py`).
-
-- **transcription_delay_ms should be 160 in batch mode, not 480.** The default 480ms
-  delay is designed for streaming mode where the model waits for more audio to arrive.
-  In batch mode (`stream=False`) the full audio is already buffered before `generate()`
-  is called, so 480ms is pure wasted latency. Use 160ms.
 
 - **Voxtral silent failure threshold is ~12s, not ~15s.** The `generate()` batch mode
   returns empty or garbage text for audio longer than ~12s (content-dependent). The
