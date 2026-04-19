@@ -32,6 +32,17 @@ logger = logging.getLogger(__name__)
 _MAX_SEGMENT_SECONDS: float = 10.0
 _MAX_SEGMENT_SAMPLES: int = int(_MAX_SEGMENT_SECONDS * SAMPLE_RATE)
 
+# When splitting long audio we search for the quietest region inside
+# [_MIN_SEGMENT_SECONDS, _MAX_SEGMENT_SECONDS] and cut there. Starting the
+# search at 8s leaves a 2s window to find a natural inter-word gap; going
+# earlier would waste decoder time on tiny segments.
+_MIN_SEGMENT_SECONDS: float = 8.0
+_MIN_SEGMENT_SAMPLES: int = int(_MIN_SEGMENT_SECONDS * SAMPLE_RATE)
+
+# RMS window for silence detection (40ms is shorter than a typical syllable,
+# long enough to average out per-sample noise).
+_SILENCE_WINDOW_SAMPLES: int = int(0.04 * SAMPLE_RATE)
+
 
 class VoxtralModel:
     """Wraps Voxtral-Mini-4B-Realtime via mlx-audio for MLX-native transcription.
@@ -176,11 +187,14 @@ class VoxtralModel:
     def _transcribe_segmented(
         self, audio: np.ndarray, language: Optional[str] = None
     ) -> str:
-        """Transcribe long audio by splitting into segments and joining results.
+        """Transcribe long audio by silence-aligned segmentation.
 
-        Voxtral Realtime's mlx-audio generate() silently returns empty text for
-        audio longer than ~15s in batch mode. We split at fixed sample boundaries
-        and join segment transcriptions with a space.
+        A naive fixed-offset split (every 10s) cuts words mid-syllable and
+        transcribes each piece with no shared context, producing mid-sentence
+        capitalisation on joins ("However, This…") and losing named entities
+        that straddle the boundary ("OpenClaw" → "open claw"). Instead we
+        locate the quietest 40ms window inside [_MIN, _MAX] seconds of each
+        segment and split there — natural inter-word gaps become cut points.
 
         Args:
             audio: 1-D float32 numpy array at 16kHz, longer than _MAX_SEGMENT_SECONDS.
@@ -189,15 +203,13 @@ class VoxtralModel:
         Returns:
             Concatenated transcription text across all segments.
         """
-        segments = [
-            audio[i : i + _MAX_SEGMENT_SAMPLES]
-            for i in range(0, len(audio), _MAX_SEGMENT_SAMPLES)
-        ]
+        boundaries = self._compute_segment_boundaries(audio)
+        segments = [audio[a:b] for a, b in boundaries]
         logger.debug(
-            "Audio %.1fs → %d segments of ≤%.0fs each",
+            "Audio %.1fs → %d silence-aligned segments: %s",
             len(audio) / SAMPLE_RATE,
             len(segments),
-            _MAX_SEGMENT_SECONDS,
+            [f"{len(s) / SAMPLE_RATE:.2f}s" for s in segments],
         )
 
         parts: list[str] = []
@@ -206,13 +218,43 @@ class VoxtralModel:
             text = self._transcribe_chunk(segment)
             seg_elapsed = time.perf_counter() - t_seg
             logger.info(
-                "Segment %d/%d (%.1fs audio): %.2fs → %r",
-                idx + 1, len(segments), len(segment) / SAMPLE_RATE, seg_elapsed, text[:60],
+                "Segment %d/%d (%.2fs audio): %.2fs inference (%.1fx realtime) → %r",
+                idx + 1,
+                len(segments),
+                len(segment) / SAMPLE_RATE,
+                seg_elapsed,
+                seg_elapsed / max(len(segment) / SAMPLE_RATE, 1e-3),
+                text[:60],
             )
             if text:
                 parts.append(text)
 
         return " ".join(parts)
+
+    @staticmethod
+    def _compute_segment_boundaries(audio: np.ndarray) -> list[tuple[int, int]]:
+        """Return (start, end) sample indices for silence-aligned segments.
+
+        Walks the buffer left-to-right. When the remaining audio exceeds
+        _MAX_SEGMENT_SAMPLES, searches for the quietest 40ms window in the
+        last 2 seconds of the candidate segment and cuts at its centre.
+        Falls back to a hard cut at _MAX_SEGMENT_SAMPLES if the audio is
+        barely longer than _MIN.
+        """
+        boundaries: list[tuple[int, int]] = []
+        start = 0
+        n = len(audio)
+        while start < n:
+            remaining = n - start
+            if remaining <= _MAX_SEGMENT_SAMPLES:
+                boundaries.append((start, n))
+                break
+            search_lo = start + _MIN_SEGMENT_SAMPLES
+            search_hi = start + _MAX_SEGMENT_SAMPLES
+            end = _find_silence_split(audio, search_lo, search_hi)
+            boundaries.append((start, end))
+            start = end
+        return boundaries
 
     def transcribe_stream(
         self,
@@ -251,3 +293,38 @@ class VoxtralModel:
             raise RuntimeError(
                 "Model is not loaded. Call VoxtralModel.load() first."
             )
+
+
+def _find_silence_split(audio: np.ndarray, lo: int, hi: int) -> int:
+    """Return the sample index of the quietest 40ms window in audio[lo:hi].
+
+    Used to pick a segment boundary that falls between words rather than
+    through one. Scans a half-overlapping grid of 40ms RMS windows and
+    returns the centre of the minimum-energy window. Falls back to ``hi``
+    when the search range is too small to hold one window.
+
+    Args:
+        audio: 1-D float32 numpy array.
+        lo: Earliest allowable split (inclusive sample index).
+        hi: Latest allowable split (exclusive sample index, hard cap).
+
+    Returns:
+        Sample index in (lo, hi] — safe to use as the ``end`` of a segment.
+    """
+    hi = min(hi, len(audio))
+    if hi - lo <= _SILENCE_WINDOW_SAMPLES:
+        return hi
+
+    window = _SILENCE_WINDOW_SAMPLES
+    hop = window // 2
+
+    best_idx = hi
+    best_energy = np.inf
+    for start in range(lo, hi - window + 1, hop):
+        frame = audio[start : start + window]
+        energy = float(np.mean(frame * frame))
+        if energy < best_energy:
+            best_energy = energy
+            best_idx = start + window // 2
+
+    return best_idx
